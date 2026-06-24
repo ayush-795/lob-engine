@@ -1,0 +1,64 @@
+@startuml architecture
+' Render:  plantuml docs/architecture.puml   (or paste into https://www.plantuml.com/plantuml)
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam defaultFontName "Helvetica"
+skinparam ArrowColor #2C3E50
+skinparam ArrowFontColor #2C3E50
+skinparam rectangle {
+  BorderColor #2C3E50
+  FontColor   #2C3E50
+}
+skinparam database {
+  BorderColor #2C3E50
+  BackgroundColor #EAF2F8
+}
+skinparam node {
+  BorderColor #2C3E50
+}
+
+title lob-engine — order book reconstruction + order-flow alpha study
+
+' ---------- inputs ----------
+database "LOBSTER\nmessage file\n(events)" as MSG #EAF2F8
+database "LOBSTER\norderbook file\n(L1 snapshots,\nground truth)" as OB #EAF2F8
+
+' ---------- C++ engine ----------
+package "C++17 engine" #F4F6F7 {
+  rectangle "load_lobster_messages()\n<size:10><i>hand-rolled scanner,\nno per-row alloc</i></size>" as PARSE
+  rectangle "OrderBook::apply()\n<size:10><i>L2, level-keyed on (price, side)\nstd::map  •  integer prices</i></size>" as BOOK
+  rectangle "--bench\n<size:10>throughput +\np50/p99/p99.9 latency</size>" as BENCH #FEF9E7
+  rectangle "--validate\n<size:10>replay book vs.\nground-truth book</size>" as VAL #FEF9E7
+}
+
+' ---------- Python research ----------
+package "Python research" #F4F6F7 {
+  rectangle "build_features.py\n<size:10>top-of-book + OFI\n(Cont–Kukanov–Stoikov 2014)</size>" as FEAT
+  rectangle "ofi_study.py\n<size:10>in/out-of-sample R²\n+ transaction-cost check</size>" as STUDY
+  rectangle "plots.py\n<size:10>OFI scatter • R² decay\n• tail latency</size>" as PLOTS
+}
+
+rectangle "figures/\n<size:10>fig1 / fig2 / fig3 (.png)</size>" as FIG #E8F8F5
+
+' ---------- flows ----------
+MSG --> PARSE
+PARSE --> BOOK
+BOOK --> BENCH
+BOOK --> VAL
+OB ..> VAL : <size:9>compare</size>
+
+OB --> FEAT
+MSG ..> FEAT : <size:9>timestamps</size>
+FEAT --> STUDY
+FEAT --> PLOTS
+BENCH ..> PLOTS : <size:9>latency.csv</size>
+PLOTS --> FIG
+
+note bottom of VAL
+  Pure message-replay is **not** bit-exact for a
+  mid-session start (opening-auction orders sit
+  outside the visible book) — quantified & disclosed,
+  not hidden. Research uses the snapshot file.
+end note
+
+@enduml
