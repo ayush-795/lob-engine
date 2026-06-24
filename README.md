@@ -47,28 +47,6 @@ python3 analysis/plots.py build/aapl_features.csv build/lat.csv   # -> analysis/
 <sub>Diagram source: [`docs/architecture.puml`](docs/architecture.puml) — render with
 `plantuml docs/architecture.puml` or paste into <https://www.plantuml.com/plantuml>.</sub>
 
-<details>
-<summary>ASCII fallback</summary>
-
-```
-LOBSTER messages ──▶ load_lobster_messages()  (hand-rolled scanner, no per-row alloc)
-                          │
-                          ▼
-                    OrderBook::apply()         add / cancel / execute, keyed on
-                          │   bids_  std::map<Price, Qty>   (best bid = rbegin)
-                          │   asks_  std::map<Price, Qty>   (best ask = begin)
-                          │   level mutations keyed on (price, side) from each msg
-                          ▼
-        ┌──────────────────────────────────────────────┐
-        │ --bench    : throughput + p50/p99/p99.9 latency        │
-        │ --validate : reconstructed book vs ground-truth book   │
-        └──────────────────────────────────────────────┘
-
-ground-truth orderbook ──▶ analysis/build_features.py ──▶ analysis/ofi_study.py
-   (exact L1 snapshots)        (top-of-book + OFI)          (predictability + cost)
-```
-</details>
-
 ### Design choices an interviewer will ask about
 - **Integer prices.** LOBSTER prices are dollars × 10⁴; kept as `int64` so the
   hot path has no float comparisons.
