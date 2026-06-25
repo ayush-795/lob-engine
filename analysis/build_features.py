@@ -1,54 +1,136 @@
 """Build the OFI research feature file from LOBSTER ground-truth data.
 
-We intentionally take top-of-book from the exchange-published *orderbook* file
-(exact L1 state) and timestamps from the aligned *message* file, rather than
+We intentionally take the book from the exchange-published *orderbook* file
+(exact L1..LM state) and timestamps from the aligned *message* file, rather than
 from message-replay. Pure message-replay cannot be bit-exact for a sample that
 begins mid-session: the stream references orders (by id) created in the opening
 auction that are outside the visible book -- see the engine's --validate mode,
 which quantifies that drift. Microstructure studies use the snapshot file for
 exactly this reason.
 
-Output columns match the C++ --dump tool: time,bid,bid_sz,ask,ask_sz,mid,ofi
+OFI definitions
+---------------
+Level-m order flow imbalance (Cont, Kukanov & Stoikov 2014; generalised to M
+levels by Cont, Cucuringu & Zhang 2023, *Cross-Impact of Order Flow Imbalance
+in Equity Markets*, Quantitative Finance 23(10)):
+
+    bid flow   a^b_m = q^b_m              if P^b_m >  P^b_m(prev)
+                       q^b_m - q^b_m(prev) if P^b_m == P^b_m(prev)
+                       -q^b_m(prev)        if P^b_m <  P^b_m(prev)
+    ask flow   a^a_m = -q^a_m             if P^a_m <  P^a_m(prev)
+                       q^a_m - q^a_m(prev) if P^a_m == P^a_m(prev)
+                       q^a_m(prev)         if P^a_m >  P^a_m(prev)
+    OFI_m      = a^b_m - a^a_m
+
+Following CCZ, each level OFI is normalised by the sample-average per-level depth
+Q = mean over (t, m) of (q^b_m + q^a_m) / 2 so the levels are comparable and the
+units are dimensionless. The *integrated* OFI is the projection of the M
+normalised level OFIs onto their first principal component (CCZ show PC1 carries
+the great majority of the variance with near-uniform, same-sign weights).
+
+Output columns
+--------------
+    time,bid,bid_sz,ask,ask_sz,mid,ofi,        <- L1, back-compat with ofi_study
+    ofi_1..ofi_M,                              <- depth-normalised per-level OFI
+    ofi_int                                    <- integrated (PC1) OFI
 
 Usage: python analysis/build_features.py <message.csv> <orderbook.csv> <out.csv>
+                                         [--levels M]
 """
 import sys
 import numpy as np
 import pandas as pd
 
 
-def main(msg_path: str, ob_path: str, out_path: str):
+def level_ofi(pb, qb, pa, qa):
+    """Per-level OFI time series from level price/size arrays (length n)."""
+    n = len(pb)
+    e = np.zeros(n)
+    # bid side
+    e[1:] += (pb[1:] > pb[:-1]) * qb[1:]
+    e[1:] += (pb[1:] == pb[:-1]) * (qb[1:] - qb[:-1])
+    e[1:] += (pb[1:] < pb[:-1]) * (-qb[:-1])
+    # ask side (subtracted)
+    e[1:] -= (pa[1:] < pa[:-1]) * (-qa[1:])
+    e[1:] -= (pa[1:] == pa[:-1]) * (qa[1:] - qa[:-1])
+    e[1:] -= (pa[1:] > pa[:-1]) * (qa[:-1])
+    return e
+
+
+def integrate(ofi_levels):
+    """First-principal-component projection of the (n, M) normalised OFI matrix.
+
+    Returns (integrated_series, weights). Weights are sign-fixed so that the
+    component points in the direction of net buy pressure (positive loadings)."""
+    X = ofi_levels - ofi_levels.mean(axis=0, keepdims=True)
+    # PC1 via SVD of the centred matrix.
+    _, _, vt = np.linalg.svd(X, full_matrices=False)
+    w = vt[0]
+    if w.sum() < 0:          # orient toward buy pressure
+        w = -w
+    return ofi_levels @ w, w
+
+
+def main(msg_path: str, ob_path: str, out_path: str, levels: int):
     # message file: time, type, id, size, price, direction
     times = pd.read_csv(msg_path, header=None, usecols=[0], names=["time"])["time"].values
 
-    # orderbook file: ask1,asz1,bid1,bsz1,ask2,...  (we only need level 1)
-    ob = pd.read_csv(ob_path, header=None, usecols=[0, 1, 2, 3],
-                     names=["ask", "ask_sz", "bid", "bid_sz"])
-    n = min(len(times), len(ob))
-    ob = ob.iloc[:n].copy()
-    ob["time"] = times[:n]
-    ob["mid"] = 0.5 * (ob["bid"] + ob["ask"])
+    # orderbook file columns repeat: ask1,asz1,bid1,bsz1, ask2,asz2,bid2,bsz2, ...
+    raw = pd.read_csv(ob_path, header=None)
+    avail = raw.shape[1] // 4
+    M = min(levels, avail)
+    if M < levels:
+        print(f"warning: file has {avail} levels, using {M}")
 
-    # Order Flow Imbalance (Cont, Kukanov & Stoikov 2014), computed from
-    # successive level-1 prices/sizes.
-    pb, qb = ob["bid"].values, ob["bid_sz"].values
-    pa, qa = ob["ask"].values, ob["ask_sz"].values
-    e = np.zeros(n)
-    e[1:] = (
-        (pb[1:] >= pb[:-1]) * qb[1:] - (pb[1:] <= pb[:-1]) * qb[:-1]
-        - (pa[1:] <= pa[:-1]) * qa[1:] + (pa[1:] >= pa[:-1]) * qa[:-1]
-    )
-    ob["ofi"] = e
+    n = min(len(times), len(raw))
+    raw = raw.iloc[:n]
 
-    ob = ob[["time", "bid", "bid_sz", "ask", "ask_sz", "mid", "ofi"]]
-    ob.to_csv(out_path, index=False, float_format="%.9g")
-    print(f"wrote {len(ob)} rows to {out_path}")
-    print(f"mean spread: {(ob.ask - ob.bid).mean():.0f} ticks "
-          f"(${(ob.ask - ob.bid).mean()/10000:.4f})")
+    out = pd.DataFrame({"time": times[:n]})
+    ofi_levels = np.zeros((n, M))
+    for m in range(M):
+        pa = raw.iloc[:, 4 * m + 0].values.astype(np.float64)
+        qa = raw.iloc[:, 4 * m + 1].values.astype(np.float64)
+        pb = raw.iloc[:, 4 * m + 2].values.astype(np.float64)
+        qb = raw.iloc[:, 4 * m + 3].values.astype(np.float64)
+        ofi_levels[:, m] = level_ofi(pb, qb, pa, qa)
+        if m == 0:
+            out["bid"], out["bid_sz"] = pb, qb
+            out["ask"], out["ask_sz"] = pa, qa
+            out["mid"] = 0.5 * (pb + pa)
+            out["ofi"] = ofi_levels[:, 0]   # raw L1 OFI, back-compat
+
+    # CCZ depth normalisation: single scalar = sample-average per-level depth.
+    qb_all = raw.iloc[:, [4 * m + 3 for m in range(M)]].values.astype(np.float64)
+    qa_all = raw.iloc[:, [4 * m + 1 for m in range(M)]].values.astype(np.float64)
+    Q = 0.5 * (qb_all + qa_all).mean()
+    ofi_norm = ofi_levels / Q
+
+    for m in range(M):
+        out[f"ofi_{m + 1}"] = ofi_norm[:, m]
+
+    out["ofi_int"], w = integrate(ofi_norm)
+
+    out.to_csv(out_path, index=False, float_format="%.9g")
+    spread = (out.ask - out.bid).mean()
+    print(f"wrote {len(out)} rows, {M} levels, to {out_path}")
+    print(f"mean spread: {spread:.0f} ticks (${spread/10000:.4f}); "
+          f"avg per-level depth Q = {Q:.0f}")
+    print("PC1 weights:", np.array2string(w, precision=3, suppress_small=True))
+    print(f"PC1 variance share: {pc1_share(ofi_norm):.1%}")
+
+
+def pc1_share(X):
+    Xc = X - X.mean(axis=0, keepdims=True)
+    s = np.linalg.svd(Xc, compute_uv=False)
+    return (s[0] ** 2) / (s ** 2).sum()
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 4:
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    levels = 10
+    if "--levels" in sys.argv:
+        levels = int(sys.argv[sys.argv.index("--levels") + 1])
+    if len(args) < 3:
         print(__doc__)
         sys.exit(1)
-    main(sys.argv[1], sys.argv[2], sys.argv[3])
+    main(args[0], args[1], args[2], levels)
