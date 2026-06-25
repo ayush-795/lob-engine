@@ -31,8 +31,8 @@ the great majority of the variance with near-uniform, same-sign weights).
 Output columns
 --------------
     time,bid,bid_sz,ask,ask_sz,mid,ofi,        <- L1, back-compat with ofi_study
-    ofi_1..ofi_M,                              <- depth-normalised per-level OFI
-    ofi_int                                    <- integrated (PC1) OFI
+    ofi_1..ofi_M,       ofi_int                <- scalar-Q normalised + PC1
+    ofi_pl_1..ofi_pl_M, ofi_int_pl             <- per-level-Q normalised + PC1
 
 Usage: python analysis/build_features.py <message.csv> <orderbook.csv> <out.csv>
                                          [--levels M]
@@ -99,24 +99,34 @@ def main(msg_path: str, ob_path: str, out_path: str, levels: int):
             out["mid"] = 0.5 * (pb + pa)
             out["ofi"] = ofi_levels[:, 0]   # raw L1 OFI, back-compat
 
-    # CCZ depth normalisation: single scalar = sample-average per-level depth.
     qb_all = raw.iloc[:, [4 * m + 3 for m in range(M)]].values.astype(np.float64)
     qa_all = raw.iloc[:, [4 * m + 1 for m in range(M)]].values.astype(np.float64)
-    Q = 0.5 * (qb_all + qa_all).mean()
+    depth = 0.5 * (qb_all + qa_all)            # (n, M) per-level depth
+
+    # (i) CCZ scalar normalisation: one average depth across all levels.
+    Q = depth.mean()
     ofi_norm = ofi_levels / Q
+    # (ii) Per-level normalisation: each level by its own average depth Q_m.
+    #      Removes the mechanical advantage deep levels get from larger sizes,
+    #      so the PC1 weight profile can be compared against (i) for confounds.
+    Qm = depth.mean(axis=0)                     # (M,)
+    ofi_norm_pl = ofi_levels / Qm
 
     for m in range(M):
         out[f"ofi_{m + 1}"] = ofi_norm[:, m]
+        out[f"ofi_pl_{m + 1}"] = ofi_norm_pl[:, m]
 
     out["ofi_int"], w = integrate(ofi_norm)
+    out["ofi_int_pl"], w_pl = integrate(ofi_norm_pl)
 
     out.to_csv(out_path, index=False, float_format="%.9g")
     spread = (out.ask - out.bid).mean()
     print(f"wrote {len(out)} rows, {M} levels, to {out_path}")
     print(f"mean spread: {spread:.0f} ticks (${spread/10000:.4f}); "
           f"avg per-level depth Q = {Q:.0f}")
-    print("PC1 weights:", np.array2string(w, precision=3, suppress_small=True))
-    print(f"PC1 variance share: {pc1_share(ofi_norm):.1%}")
+    fmt = lambda a: np.array2string(a, precision=3, suppress_small=True)
+    print(f"scalar-Q  PC1 weights: {fmt(w)}  (var share {pc1_share(ofi_norm):.1%})")
+    print(f"per-lvl   PC1 weights: {fmt(w_pl)}  (var share {pc1_share(ofi_norm_pl):.1%})")
 
 
 def pc1_share(X):
